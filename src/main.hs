@@ -30,6 +30,7 @@ import qualified Data.Serialize as S
 import GHC.Generics
 import Data.Char
 import Data.Attoparsec.Number
+import System.IO.Unsafe
 
 data Token = PreEntry | Entry T.Text | PostEntry | CharEntry Char
     deriving (Show, Read, Eq, Ord, Generic)
@@ -236,9 +237,9 @@ loadBinDatabase contexts fp = do
                 atomically $ writeTVar contexts c
                 putStrLn "Loaded Binary Database"
 
-markovGen :: StdGen -> Context -> V.Vector Token -> IO (V.Vector T.Text)
+markovGen :: StdGen -> Context -> V.Vector Token -> IO [T.Text]
 markovGen r c ts
-    | allEnds = return V.empty
+    | allEnds = return []
     | otherwise = do  
         -- We aren't going to put all this in a transaction
         -- because the consistent part doesn't matter
@@ -255,12 +256,12 @@ markovGen r c ts
             return (res, r')
         case V.unsafeLast res of
             Entry t -> do
-                rest <- markovGen r' c res
-                return $ V.cons t rest
+                rest <- unsafeInterleaveIO $ markovGen r' c res
+                return $ t : rest
             CharEntry c' -> do
-                rest <- markovGen r' c res
-                return $ V.cons (T.singleton c') rest
-            _       -> return V.empty
+                rest <- unsafeInterleaveIO $ markovGen r' c res
+                return $ (T.singleton c') : rest
+            _       -> return []
 
     where
         allEnds = V.and $ V.map (==PostEntry) ts
@@ -324,6 +325,11 @@ main = do
             liftIO $ addToDatabase (dbContext v) tokens
         post "/save" $ do
             liftIO $ saveBinDatabase contexts binfp
+        get "/drop/:name" $ do
+            name <- param "name"
+            cs <- liftIO $ readTVarIO contexts
+            liftIO $ atomically $
+                writeTVar contexts $ M.delete name cs
         post "/reloaddb" $ liftIO $ do
             loadJSONDatabase contexts jsonfp
             loadBinDatabase contexts binfp
@@ -334,7 +340,7 @@ main = do
                 start    = startVec v
             gen <- liftIO $ newStdGen
             res <- liftIO $ markovGen gen v start
-            text $ TL.fromStrict $ T.concat $ V.toList res
+            text $ TL.fromStrict $ T.concat $ take 5000 res
 
 
 
