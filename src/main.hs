@@ -1,6 +1,8 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE TypeSynonymInstances #-}
 {-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE DefaultSignatures #-}
 module Main where
 
 import qualified Data.Map.Lazy as M
@@ -24,13 +26,15 @@ import qualified Data.ByteString.Lazy as BL
 import System.Directory
 import System.Random
 import Control.Concurrent
+import qualified Data.Serialize as S
+import GHC.Generics
 
 data Token = PreEntry | Entry T.Text | PostEntry
-    deriving (Show, Read, Eq, Ord)
+    deriving (Show, Read, Eq, Ord, Generic)
 
 type TokenMap a = M.Map (V.Vector Token) a
 type RawDatabase = TokenMap (TokenMap Int)
-type TTokenMap = TokenMap (TVar (TokenMap Int))
+type TTokenMap = TokenMap (TVar (TokenMap (TVar Int)))
 type Database = TVar TTokenMap
 
 data Context = Context
@@ -44,7 +48,7 @@ data RawContext = RawContext
     , vecRawSize    :: Int
     , startRawVec   :: V.Vector Token
     }
-    deriving (Show, Read, Eq, Ord)
+    deriving (Show, Read, Eq, Ord, Generic)
 
 type ContextMap = TVar (M.Map T.Text Context)
 
@@ -90,6 +94,14 @@ instance FromJSON RawContext where
         <*> o .: "size"
         <*> o .: "def"
 
+instance S.Serialize RawContext where
+instance S.Serialize Token where
+instance S.Serialize T.Text where
+    put t = S.put $ T.encodeUtf8 t 
+    get = T.decodeUtf8 <$> S.get
+instance (S.Serialize a) => S.Serialize (V.Vector a) where
+    put t = S.putListOf S.put $ V.toList t
+    get = V.fromList <$> S.getListOf S.get
 
 tokenize :: Int -> T.Text -> [V.Vector Token]
 tokenize size text = iterateTokens size (-1) $ V.fromList $ T.words text
@@ -119,11 +131,19 @@ addToDatabase db vts    = do
         d <- readTVar db
         case M.lookup f d of
             Nothing -> do
-                e <- newTVar $ M.singleton s 1
+                one <- newTVar 1
+                e <- newTVar $ M.singleton s one
                 writeTVar db $ M.insert f e d
             Just x -> do
                 v <- readTVar x
-                writeTVar x $ M.alter a s v
+                -- writeTVar x $ M.alter a s v
+                case M.lookup s v of
+                    Just c -> do
+                        count <- readTVar c
+                        writeTVar c $ count + 1
+                    Nothing -> do
+                        count <- newTVar 1
+                        writeTVar x $ M.insert s count v
 
     addToDatabase db vts'
     where
@@ -136,7 +156,8 @@ convertToRaw :: Database -> IO RawDatabase
 convertToRaw db = do
     m <- readTVarIO db
     m' <- T.mapM readTVarIO m
-    return m'
+    m'' <- T.mapM (T.mapM readTVarIO) m'
+    return m''
 
 toRawContext :: Context -> IO RawContext
 toRawContext c = do
@@ -145,30 +166,53 @@ toRawContext c = do
 
 fromRawContext :: RawContext -> IO Context
 fromRawContext rc = do
-    m' <- T.mapM newTVarIO $ dbRawContext rc
-    m <- newTVarIO m'
+    let l = dbRawContext rc
+    m1 <- T.mapM (T.mapM newTVarIO) l
+    m2 <- T.mapM newTVarIO m1
+    m <- newTVarIO m2
     return $ Context m (vecRawSize rc) (startRawVec rc)
 
-saveDatabase :: ContextMap -> FilePath -> IO ()
-saveDatabase contexts fp = do
+saveJSONDatabase :: ContextMap -> FilePath -> IO ()
+saveJSONDatabase contexts fp = do
     cs <- readTVarIO contexts
     m <- T.mapM toRawContext cs
     BL.writeFile fp $ encode m
 
-loadDatabase :: ContextMap -> FilePath -> IO ()
-loadDatabase contexts fp = do
+saveBinDatabase :: ContextMap -> FilePath -> IO ()
+saveBinDatabase contexts fp = do
+    cs <- readTVarIO contexts
+    m <- T.mapM toRawContext cs
+    BL.writeFile fp $ S.encodeLazy m
+
+loadJSONDatabase :: ContextMap -> FilePath -> IO ()
+loadJSONDatabase contexts fp = do
     exists <- doesFileExist fp
     when exists $ do
         f <- BL.readFile fp
-        putStrLn "Loading Database"
+        putStrLn "Loading JSON Database"
         case eitherDecode f of
             Left err -> do
-                putStrLn "Database Load Failed!"
+                putStrLn "JSON Database Load Failed!"
                 putStrLn err
             Right v -> do
                 c <- T.mapM fromRawContext v
                 atomically $ writeTVar contexts c
-                putStrLn "Loaded Database"
+                putStrLn "Loaded JSON Database"
+
+loadBinDatabase :: ContextMap -> FilePath -> IO ()
+loadBinDatabase contexts fp = do
+    exists <- doesFileExist fp
+    when exists $ do
+        f <- BL.readFile fp
+        putStrLn "Loading Binary Database"
+        case S.decodeLazy f of
+            Left err -> do
+                putStrLn "Binary Database Load Failed!"
+                putStrLn err
+            Right v -> do
+                c <- T.mapM fromRawContext v
+                atomically $ writeTVar contexts c
+                putStrLn "Loaded Binary Database"
 
 markovGen :: StdGen -> Context -> V.Vector Token -> IO (V.Vector T.Text)
 markovGen r c ts
@@ -181,7 +225,8 @@ markovGen r c ts
         let (Just v) = M.lookup ts db
         (res, r') <- atomically $ do
             -- Unwrap the map
-            u <- readTVar v
+            um <- readTVar v
+            u <- T.mapM readTVar um
             let total = M.foldr (+) 0 u
                 (s, r') = randomR (0, total-1) r
                 (_, Just res) = M.foldrWithKey f (s, Nothing) u
@@ -203,12 +248,15 @@ markovGen r c ts
 main :: IO ()
 main = do
     putStrLn "Starting server"
-    let fp = "db.json"
+    let jsonfp = "db.json"
+        binfp = "db.bin"
     contexts <- newTVarIO M.empty
-    loadDatabase contexts fp
+    loadJSONDatabase contexts jsonfp
+    loadBinDatabase contexts binfp
+
     _ <- forkIO $ forever $ do
         threadDelay 600000000
-        saveDatabase contexts fp
+        saveBinDatabase contexts binfp
     scotty 4800 $ do
         get "/" $ do
             m <- liftIO $ readTVarIO contexts
@@ -227,12 +275,12 @@ main = do
                         let st = V.replicate size PreEntry
                             v = Context m' size st
                         writeTVar contexts $ M.insert name v m
-        get "/dump/:name" $ do
-            name <- param "name"
-            cs <- liftIO $ readTVarIO contexts
-            let (Just v) = M.lookup name cs
-            raw <- liftIO $ convertToRaw $ dbContext v
-            json raw
+--        get "/dump/:name" $ do
+--            name <- param "name"
+--            cs <- liftIO $ readTVarIO contexts
+--            let (Just v) = M.lookup name cs
+--            raw <- liftIO $ convertToRaw $ dbContext v
+--            json raw
         get (regex "^/add/([^/]+)/(.*)$") $ do
             name <- param "1"
             entry <- param "2"
@@ -249,8 +297,11 @@ main = do
             let (Just v) = M.lookup name cs
                 tokens = tokenize (vecSize v) entry 
             liftIO $ addToDatabase (dbContext v) tokens
-        post "/save" $ liftIO $ saveDatabase contexts fp
-        post "/reloaddb" $ liftIO $ loadDatabase contexts fp
+        post "/save" $ do
+            liftIO $ saveBinDatabase contexts binfp
+        post "/reloaddb" $ liftIO $ do
+            loadJSONDatabase contexts jsonfp
+            loadBinDatabase contexts binfp
         get "/gen/:name" $ do
             name <- param "name"
             cs <- liftIO $ readTVarIO contexts
