@@ -323,6 +323,15 @@ main = do
             let (Just v) = M.lookup name cs
                 tokens = tokenize (vecSize v) entry 
             liftIO $ addToDatabase (dbContext v) tokens
+        post "/add/:name" $ do
+            name <- param "name"
+            b <- body
+            let entry' = TL.decodeUtf8 b
+                entry = TL.toStrict entry'
+            cs <- liftIO $ readTVarIO contexts
+            let (Just v) = M.lookup name cs
+                tokens = tokenize (vecSize v) entry 
+            liftIO $ addToDatabase (dbContext v) tokens
         post "/save" $ do
             liftIO $ saveBinDatabase contexts binfp
         get "/drop/:name" $ do
