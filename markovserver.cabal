@@ -69,6 +69,7 @@ executable markovserver
                      , directory
                      , bytestring
                      , cereal
+                     , attoparsec
   
   -- Directories containing source files.
   hs-source-dirs: src

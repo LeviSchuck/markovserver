@@ -19,7 +19,7 @@ import Data.List
 import qualified Data.Text.Encoding as T
 import qualified Data.Text.Lazy.Encoding as TL
 import Data.Aeson hiding (json)
-import Data.Aeson.Types
+import Data.Aeson.Types as AT
 import Control.Applicative ((<$>), (<*>), (<|>), pure, empty)
 import Control.Monad as M
 import qualified Data.ByteString.Lazy as BL
@@ -28,8 +28,10 @@ import System.Random
 import Control.Concurrent
 import qualified Data.Serialize as S
 import GHC.Generics
+import Data.Char
+import Data.Attoparsec.Number
 
-data Token = PreEntry | Entry T.Text | PostEntry
+data Token = PreEntry | Entry T.Text | PostEntry | CharEntry Char
     deriving (Show, Read, Eq, Ord, Generic)
 
 type TokenMap a = M.Map (V.Vector Token) a
@@ -67,12 +69,15 @@ instance ToJSON Token where
     toJSON PreEntry = Bool False
     toJSON PostEntry = Bool True
     toJSON (Entry t) = String t
+    toJSON (CharEntry c) = AT.Number . I . fromIntegral $ ord c
+
 instance FromJSON Token where
     parseJSON v = case v of
         Bool b -> case b of
             False -> pure PreEntry
             True -> pure PostEntry
         String t -> pure $ Entry t
+        AT.Number (I c) -> pure $ CharEntry $ chr $ fromIntegral c
         _ -> typeMismatch "Token" v
 instance (FromJSON a) => FromJSON (TokenMap a) where
     parseJSON v = M.fromList <$> parseJSON v
@@ -103,8 +108,25 @@ instance (S.Serialize a) => S.Serialize (V.Vector a) where
     put t = S.putListOf S.put $ V.toList t
     get = V.fromList <$> S.getListOf S.get
 
+splitText :: T.Text -> [T.Text]
+splitText t
+    | T.null t = []
+    | otherwise =
+        let (a,b) = T.break breakage t
+        in if T.null a
+            then (T.singleton $ T.head b) : (splitText $ T.tail b)
+            else        a : splitText b
+
+breakage :: Char -> Bool
+breakage '\'' = False
+breakage c
+    | isSpace c = True
+    | isAlphaNum c = False
+    | isPunctuation c = True
+    | otherwise = False
+
 tokenize :: Int -> T.Text -> [V.Vector Token]
-tokenize size text = iterateTokens size (-1) $ V.fromList $ T.words text
+tokenize size text = iterateTokens size (-1) $ V.fromList $ splitText text
 
 iterateTokens :: Int -> Int -> V.Vector T.Text -> [V.Vector Token]
 iterateTokens size pos source
@@ -235,6 +257,9 @@ markovGen r c ts
             Entry t -> do
                 rest <- markovGen r' c res
                 return $ V.cons t rest
+            CharEntry c' -> do
+                rest <- markovGen r' c res
+                return $ V.cons (T.singleton c') rest
             _       -> return V.empty
 
     where
@@ -247,7 +272,6 @@ markovGen r c ts
 
 main :: IO ()
 main = do
-    putStrLn "Starting server"
     let jsonfp = "db.json"
         binfp = "db.bin"
     contexts <- newTVarIO M.empty
@@ -257,6 +281,7 @@ main = do
     _ <- forkIO $ forever $ do
         threadDelay 600000000
         saveBinDatabase contexts binfp
+    putStrLn "Starting server"
     scotty 4800 $ do
         get "/" $ do
             m <- liftIO $ readTVarIO contexts
@@ -309,7 +334,7 @@ main = do
                 start    = startVec v
             gen <- liftIO $ newStdGen
             res <- liftIO $ markovGen gen v start
-            text $ TL.fromStrict $ T.intercalate " " $ V.toList res
+            text $ TL.fromStrict $ T.concat $ V.toList res
 
 
 
