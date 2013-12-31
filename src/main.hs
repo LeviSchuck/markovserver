@@ -23,6 +23,7 @@ import Control.Monad as M
 import qualified Data.ByteString.Lazy as BL
 import System.Directory
 import System.Random
+import Control.Concurrent
 
 data Token = PreEntry | Entry T.Text | PostEntry
     deriving (Show, Read, Eq, Ord)
@@ -148,6 +149,12 @@ fromRawContext rc = do
     m <- newTVarIO m'
     return $ Context m (vecRawSize rc) (startRawVec rc)
 
+saveDatabase :: ContextMap -> FilePath -> IO ()
+saveDatabase contexts fp = do
+    cs <- readTVarIO contexts
+    m <- T.mapM toRawContext cs
+    BL.writeFile fp $ encode m
+
 loadDatabase :: ContextMap -> FilePath -> IO ()
 loadDatabase contexts fp = do
     exists <- doesFileExist fp
@@ -199,7 +206,9 @@ main = do
     let fp = "db.json"
     contexts <- newTVarIO M.empty
     loadDatabase contexts fp
-
+    _ <- forkIO $ forever $ do
+        threadDelay 600000000
+        saveDatabase contexts fp
     scotty 4800 $ do
         get "/" $ do
             m <- liftIO $ readTVarIO contexts
@@ -240,10 +249,7 @@ main = do
             let (Just v) = M.lookup name cs
                 tokens = tokenize (vecSize v) entry 
             liftIO $ addToDatabase (dbContext v) tokens
-        post "/save" $ liftIO $ do
-            cs <- readTVarIO contexts
-            m <- T.mapM toRawContext cs
-            BL.writeFile fp $ encode m
+        post "/save" $ liftIO $ saveDatabase contexts fp
         post "/reloaddb" $ liftIO $ loadDatabase contexts fp
         get "/gen/:name" $ do
             name <- param "name"
